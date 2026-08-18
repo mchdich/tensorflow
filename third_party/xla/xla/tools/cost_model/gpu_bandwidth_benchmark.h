@@ -32,8 +32,15 @@ struct BandwidthEntry {
 };
 
 // Returns theoretical peak GPU memory bandwidth in bytes per second for
-// `device_id`.
-absl::StatusOr<double> GetPeakBandwidthBytesPerSec(int device_id);
+// `ordinal`.
+absl::StatusOr<double> GetPeakBandwidthBytesPerSec(int ordinal);
+
+// Measures GPU device-to-device memcpy bandwidth in bytes per second for
+// `size_bytes` on `ordinal`. Performs warmup iterations and averages over
+// multiple measurement iterations using event timers.
+absl::StatusOr<double> MeasureD2dBandwidthBytesPerSec(
+    int ordinal, int64_t size_bytes, int warmup_runs = 10,
+    int measurement_runs = 100);
 
 // Formats bandwidth table entries into a human-readable table.
 std::string FormatBandwidthTable(absl::Span<const BandwidthEntry> entries);
