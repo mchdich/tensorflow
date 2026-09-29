@@ -43,6 +43,7 @@ limitations under the License.
 #include "xla/service/compiler.h"
 #include "xla/service/executable.h"
 #include "xla/service/gpu/alias_info.h"
+#include "xla/service/gpu/mlir_context_pool.h"
 #include "xla/service/hlo_module_config.h"
 #include "xla/service/platform_util.h"
 #include "xla/stream_executor/cuda/cuda_compute_capability.h"
@@ -295,6 +296,27 @@ TEST_P(TritonBackendTest, Compile) {
                            *(module->entry_computation()->root_instruction())));
   ASSERT_THAT(configs, Not(IsEmpty()));
   absl::StatusOr<std::unique_ptr<Executable>> executable = backend_.Compile(
+      *(module->entry_computation()->root_instruction()), *configs[0]);
+  EXPECT_THAT(executable, absl_testing::IsOk());
+}
+
+TEST_P(TritonBackendTest, CompileWithMlirContextPool) {
+  MlirContextPool mlir_context_pool([] {
+    auto ctx = std::make_unique<mlir::MLIRContext>(
+        mlir::MLIRContext::Threading::DISABLED);
+    ctx->disableMultithreading();
+    RegisterSymbolicExprStorage(ctx.get());
+    return ctx;
+  });
+  TritonBackend backend(&debug_options_, compiler_.get(), &target_config_,
+                        &alias_info_, &mlir_context_, &mlir_context_pool);
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
+                       ParseAndReturnVerifiedModule(kHlo));
+  ASSERT_OK_AND_ASSIGN(std::vector<std::unique_ptr<BackendConfig>> configs,
+                       backend.GetSupportedConfigs(
+                           *(module->entry_computation()->root_instruction())));
+  ASSERT_THAT(configs, Not(IsEmpty()));
+  absl::StatusOr<std::unique_ptr<Executable>> executable = backend.Compile(
       *(module->entry_computation()->root_instruction()), *configs[0]);
   EXPECT_THAT(executable, absl_testing::IsOk());
 }

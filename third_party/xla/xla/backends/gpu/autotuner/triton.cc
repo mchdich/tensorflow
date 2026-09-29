@@ -22,7 +22,6 @@ limitations under the License.
 #include <variant>
 #include <vector>
 
-#include "google/protobuf/any.pb.h"
 #include "absl/container/flat_hash_map.h"
 #include "absl/log/check.h"
 #include "absl/log/log.h"
@@ -59,6 +58,7 @@ limitations under the License.
 #include "xla/service/gpu/gpu_float_support.h"
 #include "xla/service/gpu/ir_emission_utils.h"
 #include "xla/service/gpu/matmul_utils.h"
+#include "xla/service/gpu/mlir_context_pool.h"
 #include "xla/service/gpu/model/triton_emitter_constraints.h"
 #include "xla/service/hlo_cost_analysis.h"
 #include "xla/service/instruction_fusion.h"
@@ -324,11 +324,14 @@ absl::StatusOr<std::unique_ptr<HloModule>> TritonBackend::RunHloPasses(
     ABSL_RETURN_IF_ERROR(float_normalization.Run(hlo_module.get()).status());
   }
 
+  ABSL_ASSIGN_OR_RETURN(PooledOrFallbackMlirContext context,
+                   BorrowMlirContextOr(mlir_context_pool_, mlir_context_));
+
   HloCostAnalysis::Options priority_fusion_options;
   priority_fusion_options.count_multiple_input_accesses = true;
   PriorityFusion priority_fusion(
       /*thread_pool=*/nullptr, gpu_device_info, alias_info_,
-      priority_fusion_options, mlir_context_);
+      priority_fusion_options, context.get());
   ABSL_RETURN_IF_ERROR(priority_fusion.Run(hlo_module.get()).status());
 
   // If the priority fusion pass above skipped some instructions, turn them
@@ -336,7 +339,7 @@ absl::StatusOr<std::unique_ptr<HloModule>> TritonBackend::RunHloPasses(
   FusionWrapper fusion_wrapper(gpu_device_info);
   ABSL_RETURN_IF_ERROR(fusion_wrapper.Run(hlo_module.get()).status());
   ConvertTritonGemmConfig convert_triton_gemm_config(gpu_device_info,
-                                                     mlir_context_);
+                                                     context.get());
   ABSL_RETURN_IF_ERROR(convert_triton_gemm_config.Run(hlo_module.get()).status());
   return hlo_module;
 }
@@ -362,8 +365,14 @@ bool TritonBackend::IsSupported(const HloInstruction& instr) {
             ->config()
             .debug_options()
             .xla_gpu_experimental_enable_tiling_propagation()) {
+      absl::StatusOr<PooledOrFallbackMlirContext> context =
+          BorrowMlirContextOr(mlir_context_pool_, mlir_context_);
+      if (!context.ok()) {
+        VLOG(1) << "Failed to borrow MLIRContext: " << context.status();
+        return false;
+      }
       auto ts =
-          experimental::TilingSpace::Create(*fusion_adaptor, mlir_context_);
+          experimental::TilingSpace::Create(*fusion_adaptor, context->get());
       if (!ts.ok()) {
         VLOG(1) << "Failed to create tiling space: " << ts.status().message();
         return false;

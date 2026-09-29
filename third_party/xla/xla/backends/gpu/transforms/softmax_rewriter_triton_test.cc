@@ -35,7 +35,7 @@ limitations under the License.
 #include "xla/service/gpu/alias_info.h"
 #include "xla/service/gpu/backend_configs.pb.h"
 #include "xla/service/gpu/gpu_device_info_for_tests.h"
-#include "xla/service/gpu/model/gpu_indexing_performance_model.h"
+#include "xla/service/gpu/mlir_context_pool.h"
 #include "xla/service/hlo_cost_analysis.h"
 #include "xla/service/instruction_fusion.h"
 #include "xla/service/pattern_matcher.h"
@@ -1194,8 +1194,10 @@ ENTRY main {
   // cost model must give each candidate its own context.
   MlirContextPool mlir_context_pool(
       [] {
-        return std::make_unique<mlir::MLIRContext>(
+        auto ctx = std::make_unique<mlir::MLIRContext>(
             mlir::MLIRContext::Threading::DISABLED);
+        ctx->disableMultithreading();
+        return ctx;
       },
       /*preallocate=*/4);
   SoftmaxRewriterTriton rewriter(

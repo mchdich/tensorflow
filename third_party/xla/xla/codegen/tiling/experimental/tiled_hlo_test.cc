@@ -130,20 +130,14 @@ TEST_F(TiledHloTest, TiledHloRegionInvalidRootFailsCheck) {
   auto fusion_adaptor = HloFusionAdaptor::ForInstruction(root);
   ASSERT_OK_AND_ASSIGN(auto tiling_space,
                        TilingSpace::Create(*fusion_adaptor, &mlir_context_));
-  auto instr =
-      std::make_unique<TiledHloInstruction>(root, Tile(*tiling_space, {}));
-  const TiledHloInstruction* raw_instr = instr.get();
+  TiledHloInstruction member_instr(root, Tile(*tiling_space, {}));
+  TiledHloInstruction* member_raw = &member_instr;
 
-  auto unowned_instr =
-      std::make_unique<TiledHloInstruction>(root, Tile(*tiling_space, {}));
-  const TiledHloInstruction* unowned_raw = unowned_instr.get();
+  TiledHloInstruction outside_instr(root, Tile(*tiling_space, {}));
+  const TiledHloInstruction* outside_raw = &outside_instr;
 
-  std::vector<std::unique_ptr<TiledHloInstruction>> instructions;
-  instructions.push_back(std::move(instr));
-
-  EXPECT_DEATH(
-      TiledHloRegion(std::move(instructions), {raw_instr, unowned_raw}),
-      "must be present in the region");
+  EXPECT_DEATH(TiledHloRegion({member_raw}, {member_raw, outside_raw}),
+               "must be present in the region");
 }
 
 MATCHER_P2(IsHloWithOperands, opcode, operand_opcodes,

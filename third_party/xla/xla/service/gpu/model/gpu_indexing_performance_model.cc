@@ -62,9 +62,9 @@ limitations under the License.
 #include "xla/hlo/ir/hlo_print_options.h"
 #include "xla/hlo/utils/hlo_traversal.h"
 #include "xla/service/decision.h"
-#include "xla/service/gpu/backend_configs.pb.h"
 #include "xla/service/gpu/hlo_fusion_analysis.h"
 #include "xla/service/gpu/ir_emission_utils.h"
+#include "xla/service/gpu/mlir_context_pool.h"
 #include "xla/service/gpu/model/coalescing_analysis.h"
 #include "xla/service/gpu/model/gpu_dot_fusion_cost_model.h"
 #include "xla/service/gpu/model/gpu_hlo_cost_analysis.h"
@@ -220,7 +220,7 @@ void ForEachInstructionInTiledHloComputation(
       int64_t num_blocks_cur_region =
           GetNumBlocksForRegion(instruction, num_blocks_cur_hlo, i);
       for (const auto& tiled_hlo : region.instructions()) {
-        worklist.push_back({tiled_hlo.get(), num_blocks_cur_region});
+        worklist.push_back({&*tiled_hlo, num_blocks_cur_region});
       }
     }
   }
@@ -687,14 +687,11 @@ absl::StatusOr<std::optional<TiledRunTimeData>> EvaluateCandidate(
     absl::FunctionRef<int64_t(const HloInstruction*)> flops_fn) {
   // Cloning is faster than calling TilingSpace::Create() for each tiling
   // candidate.
-  std::optional<MlirContextPool::BorrowedObject> borrowed_context;
-  mlir::MLIRContext* target_context = nullptr;
-  if (mlir_context_pool != nullptr) {
-    ABSL_ASSIGN_OR_RETURN(borrowed_context, mlir_context_pool->GetOrCreate());
-    target_context = (*borrowed_context)->get();
-  }
+  ABSL_ASSIGN_OR_RETURN(
+      PooledOrFallbackMlirContext context,
+      BorrowMlirContextOr(mlir_context_pool, base_tiling_space.mlir_context()));
   std::unique_ptr<experimental::TilingSpace> tiling_space =
-      base_tiling_space.Clone(target_context);
+      base_tiling_space.Clone(context.get());
   ABSL_RETURN_IF_ERROR(tiling_space->AssignTileSizes(padded_tile_sizes));
   VLOG(3) << "Trying tile sizes " << absl::StrJoin(padded_tile_sizes, ",");
 
@@ -741,17 +738,32 @@ tsl::Future<TopKTiledRunTimeDataOrError> TryFindTopKBestTilingsWithTilingSpace(
       << "Concurrent tiling evaluation requires either an MlirContextPool or "
          "an MLIRContext with multithreading enabled.";
 
-  ABSL_ASSIGN_OR_RETURN(
-      std::unique_ptr<experimental::TilingSpace> base_tiling_space_unique,
-      experimental::TilingSpace::Create(fusion_adaptor, mlir_context));
+  // When a context pool is provided, borrow a context for the base TilingSpace
+  // as well, since callers such as PriorityFusionQueue::ComputePriorities may
+  // invoke TryFindTopKBestTilingsForFusionAsync concurrently across multiple
+  // worker threads while sharing a single-threaded `mlir_context`.
+  struct SharedTilingSpace {
+    PooledOrFallbackMlirContext context;
+    std::unique_ptr<experimental::TilingSpace> tiling_space;
+  };
+  ABSL_ASSIGN_OR_RETURN(PooledOrFallbackMlirContext context,
+                   BorrowMlirContextOr(mlir_context_pool, mlir_context));
+  auto shared_state = std::make_shared<SharedTilingSpace>(
+      SharedTilingSpace{std::move(context), nullptr});
 
-  ABSL_ASSIGN_OR_RETURN(auto tilings, base_tiling_space_unique->GetValidTilings());
+  ABSL_ASSIGN_OR_RETURN(shared_state->tiling_space,
+                   experimental::TilingSpace::Create(
+                       fusion_adaptor, shared_state->context.get()));
+
+  ABSL_ASSIGN_OR_RETURN(auto tilings, shared_state->tiling_space->GetValidTilings());
   VLOG(1) << absl::StrCat(
       "TryFindTopKBestTilingsForFusionAsync tiling_space evaluating ",
       tilings.size(), " tilings.");
 
-  std::shared_ptr<const experimental::TilingSpace> base_tiling_space =
-      std::move(base_tiling_space_unique);
+  const experimental::TilingSpace* raw_base_tiling_space =
+      shared_state->tiling_space.get();
+  std::shared_ptr<const experimental::TilingSpace> base_tiling_space(
+      std::move(shared_state), raw_base_tiling_space);
 
   std::vector<tsl::Future<std::optional<TiledRunTimeData>>> candidate_futures;
   candidate_futures.reserve(tilings.size());
@@ -957,9 +969,11 @@ GpuPerformanceModelWithIndexingAnalysis::EstimateRunTimeForTiledFusion(
     const HloFusionAdaptor& fusion_adaptor,
     const BlockLevelParameters& block_level_parameters) {
   if (use_experimental_tiling_) {
+    ABSL_ASSIGN_OR_RETURN(PooledOrFallbackMlirContext context,
+                     BorrowMlirContextOr(mlir_context_pool_, mlir_context_));
     ABSL_ASSIGN_OR_RETURN(
         std::unique_ptr<experimental::TilingSpace> tiling_space,
-        experimental::TilingSpace::Create(fusion_adaptor, mlir_context_));
+        experimental::TilingSpace::Create(fusion_adaptor, context.get()));
 
     ABSL_ASSIGN_OR_RETURN(
         llvm::SmallVector<int64_t> tile_sizes,

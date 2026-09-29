@@ -33,12 +33,14 @@ limitations under the License.
 #include "xla/hlo/analysis/symbolic_expr.h"
 #include "xla/hlo/ir/hlo_computation.h"
 #include "xla/hlo/ir/hlo_instruction.h"
+#include "xla/hlo/ir/hlo_print_options.h"
 #include "xla/hlo/testlib/hlo_hardware_independent_test_base.h"
 #include "xla/hlo/testlib/pattern_matcher_gmock.h"
 #include "xla/service/gpu/backend_configs.pb.h"
 #include "xla/service/gpu/gpu_device_info_for_tests.h"
 #include "xla/service/gpu/gpu_fusible.h"
 #include "xla/service/gpu/hlo_fusion_analysis.h"
+#include "xla/service/gpu/mlir_context_pool.h"
 #include "xla/service/gpu/model/gpu_hlo_cost_analysis.h"
 #include "xla/service/hlo_cost_analysis.h"
 #include "xla/service/hlo_module_config.h"
@@ -104,6 +106,56 @@ INSTANTIATE_TEST_SUITE_P(
     [](const ::testing::TestParamInfo<PriorityFusionTest::ParamType>& info) {
       return info.param ? "TilingPropagation" : "SymbolicAnalysis";
     });
+
+TEST_P(PriorityFusionTest, ParallelTilingSearchMatchesSerialTilingSearch) {
+  constexpr absl::string_view kHlo = R"(
+    HloModule test_module
+
+    ENTRY main {
+      %p0 = f32[64,256] parameter(0)
+      %p1 = f32[64,256] parameter(1)
+      %log = f32[64,256] log(%p0)
+      %exp = f32[64,256] exponential(%p1)
+      %multiply = f32[64,256] multiply(%log, %exp)
+      %add = f32[64,256] add(%multiply, %p0)
+      ROOT %negate = f32[64,256] negate(%add)
+    })";
+
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> serial_module,
+                       ParseAndReturnVerifiedModule(kHlo));
+  ASSERT_OK_AND_ASSIGN(bool serial_changed,
+                       priority_fusion_.Run(serial_module.get()));
+
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> parallel_module,
+                       ParseAndReturnVerifiedModule(kHlo));
+  tsl::thread::ThreadPool thread_pool(tsl::Env::Default(), "test_pool", 8);
+  // Mirrors the contexts GpuCompiler pools: multithreading is disabled, so the
+  // cost model must give each candidate its own context.
+  MlirContextPool mlir_context_pool(
+      [] {
+        auto ctx = std::make_unique<mlir::MLIRContext>(
+            mlir::MLIRContext::Threading::DISABLED);
+        ctx->disableMultithreading();
+        RegisterSymbolicExprStorage(ctx.get());
+        return ctx;
+      },
+      /*preallocate=*/8);
+  mlir::MLIRContext parallel_mlir_context(
+      mlir::MLIRContext::Threading::DISABLED);
+  parallel_mlir_context.disableMultithreading();
+  RegisterSymbolicExprStorage(&parallel_mlir_context);
+  GpuHloCostAnalysis::Options options;
+  options.count_multiple_input_accesses = true;
+  PriorityFusion parallel_priority_fusion(
+      &thread_pool, device_info_, &alias_info_, options, &parallel_mlir_context,
+      &mlir_context_pool);
+  ASSERT_OK_AND_ASSIGN(bool parallel_changed,
+                       parallel_priority_fusion.Run(parallel_module.get()));
+
+  EXPECT_EQ(parallel_changed, serial_changed);
+  EXPECT_EQ(parallel_module->ToString(HloPrintOptions::ShortParsable()),
+            serial_module->ToString(HloPrintOptions::ShortParsable()));
+}
 
 TEST_P(PriorityFusionTest, FuseWithSharedArgument) {
   auto module = ParseAndReturnVerifiedModule(R"(
@@ -1244,6 +1296,27 @@ ENTRY main {
   EXPECT_TRUE(IsGenericTritonFusion(*fusion2));
 }
 
+TEST_P(PriorityFusionTest,
+       ProducerWithOnlyBitcastUsersHasNoMultiOutputFusionCandidates) {
+  // `negate` can only be fused into bitcasts, so there are no candidates for
+  // Triton multi-output fusion either.
+  constexpr absl::string_view kHloText = R"(
+HloModule t
+
+ENTRY main {
+  p0 = f32[16,32] parameter(0)
+  negate = f32[16,32] negate(p0)
+  ROOT bitcast = f32[512] bitcast(negate)
+})";
+
+  ASSERT_OK_AND_ASSIGN(auto module, ParseAndReturnVerifiedModule(kHloText));
+  module->mutable_config()
+      .mutable_debug_options()
+      .set_xla_gpu_unsupported_enable_triton_multi_output_fusion(true);
+  ASSERT_OK_AND_ASSIGN(bool changed, priority_fusion_.Run(module.get()));
+  EXPECT_FALSE(changed);
+}
+
 TEST_P(PriorityFusionTest, TritonProducerNotSupported_DoNotFuse) {
   const std::string kHloText = R"(
 HloModule t
@@ -1507,7 +1580,7 @@ TEST_P(HerolessPriorityFusionTest, LimitNumberOfParameters) {
     module_text +=
         absl::StrFormat("add%d = f32[] add(add%d, p%d)\n", i, i - 1, i);
   }
-  module_text += "}";
+  module_text += '}';
   TF_ASSERT_OK_AND_ASSIGN(auto module,
                           ParseAndReturnVerifiedModule(module_text));
   EXPECT_THAT(priority_fusion_.Run(module.get()),
