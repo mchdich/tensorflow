@@ -4787,6 +4787,7 @@ xla_test(
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
         "@com_google_googletest//:gtest",
+        "@tsl//tsl/platform",
     ],
 )
 
@@ -4898,6 +4899,7 @@ xla_cc_test(
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
         "@com_google_googletest//:gtest_main",
+        "@tsl//tsl/platform",
     ],
 )
 
